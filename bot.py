@@ -4,6 +4,7 @@ import time
 from datetime import datetime
 from telebot import TeleBot
 import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 class TaskManager:
     def __init__(self, database):
@@ -23,6 +24,11 @@ class TaskManager:
             status TEXT DEFAULT 'pending',
             user_id INTEGER NOT NULL
             )""")
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS users(
+            user_id INTEGER PRIMARY KEY,
+            points INTEGER DEFAULT 0
+            )""")
             conn.commit()
 
     def add_task(self, user_id, name, theme, priority, deadline):
@@ -41,6 +47,7 @@ class TaskManager:
         conn = sqlite3.connect(self.database)
         with conn:
             conn.execute("UPDATE tasks SET status = 'done' WHERE name = ? AND user_id = ?", (task_name, user_id))
+            conn.execute("INSERT INTO users (user_id, points) VALUES (?, 1) ON CONFLICT(user_id) DO UPDATE SET points = points + 1", (user_id,))
             conn.commit()
 
     def show_tasks(self, user_id):
@@ -49,28 +56,18 @@ class TaskManager:
             cur = conn.cursor()
             cur.execute("SELECT name, theme, priority, deadline, status FROM tasks WHERE user_id = ?", (user_id,))
             return cur.fetchall()
-    
-    def show_high_priority_tasks(self, user_id):
-        conn = sqlite3.connect(self.database)
-        with conn:
-            cur = conn.cursor()
-            cur.execute("SELECT name FROM tasks WHERE user_id = ? AND priority = 'высокий'", (user_id,))
-            return cur.fetchall()
 
-    def get_statistics(self, user_id):
+    def get_user_points(self, user_id):
         conn = sqlite3.connect(self.database)
         with conn:
             cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status = 'done'", (user_id,))
-            completed = cur.fetchone()[0]
-            cur.execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status = 'pending'", (user_id,))
-            pending = cur.fetchone()[0]
-            cur.execute("SELECT COUNT(*) FROM tasks WHERE user_id = ?", (user_id,))
-            total = cur.fetchone()[0]
-            return completed, pending, total
+            cur.execute("SELECT points FROM users WHERE user_id = ?", (user_id,))
+            result = cur.fetchone()
+            return result[0] if result else 0
 
 bot = TeleBot("TOKEN")
 task_manager = TaskManager("database.db")
+
 
 @bot.message_handler(commands=['start'])
 def start_command(message):
@@ -124,15 +121,6 @@ def delete_task(message):
     task_manager.delete_task(task_name, user_id)
     bot.send_message(message.chat.id, "Задача удалена")
 
-@bot.message_handler(commands=['show'])
-def show_tasks(message):
-    user_id = message.from_user.id
-    tasks = task_manager.show_tasks(user_id)
-    if tasks:
-        response = "\n".join([f"{name} (Тема: {theme}, Приоритет: {priority}, Дедлайн: {deadline}, Статус: {status})" for name, theme, priority, deadline, status in tasks])
-        bot.send_message(message.chat.id, response)
-    else:
-        bot.send_message(message.chat.id, "Задач нет")
 
 @bot.message_handler(commands=['show_high_priority'])
 def show_high_priority_tasks(message):
@@ -143,15 +131,66 @@ def show_high_priority_tasks(message):
         bot.send_message(message.chat.id, "🔴 Высокоприоритетные задачи:\n" + response)
     else:
         bot.send_message(message.chat.id, "Нет высокоприоритетных задач")
+@bot.message_handler(commands=['mark_done'])
+def mark_done_command(message):
+    bot.send_message(message.chat.id, "Введите имя задачи, которую хотите отметить как выполненную:")
+    bot.register_next_step_handler(message, mark_task_done)
+
+def mark_task_done(message):
+    user_id = message.from_user.id
+    task_name = message.text
+    task_manager.mark_task_done(task_name, user_id)
+    bot.send_message(message.chat.id, "Задача отмечена как выполненная")
+    
+@bot.message_handler(commands=['show'])
+def show_tasks(message):
+    user_id = message.from_user.id
+    tasks = task_manager.show_tasks(user_id)
+    if not tasks:
+        bot.send_message(message.chat.id, "📭 У вас нет задач.")
+        return
+    
+    for name, theme, priority, deadline, status in tasks:
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("✅ Выполнено", callback_data=f"done_{name}"))
+        markup.add(InlineKeyboardButton("❌ Удалить", callback_data=f"delete_{name}"))
+        response = f"📌 *{name}*\n📂 _{theme}_\n⚠️ *{priority}*\n⏳ {deadline}\n📍 {status}"
+        bot.send_message(message.chat.id, response, reply_markup=markup, parse_mode="Markdown")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("done_"))
+def mark_task_done_callback(call):
+    task_name = call.data.split("_", 1)[1]
+    user_id = call.from_user.id
+    task_manager.mark_task_done(task_name, user_id)
+    bot.send_message(call.message.chat.id, f"✅ Задача *{task_name}* выполнена! +1 🎉", parse_mode="Markdown")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("delete_"))
+def delete_task_callback(call):
+    task_name = call.data.split("_", 1)[1]
+    user_id = call.from_user.id
+    task_manager.delete_task(task_name, user_id)
+    bot.send_message(call.message.chat.id, f"❌ Задача *{task_name}* удалена!", parse_mode="Markdown")
 
 @bot.message_handler(commands=['stats'])
 def show_statistics(message):
     user_id = message.from_user.id
-    completed, pending, total = task_manager.get_statistics(user_id)
-    if total > 0:
-        completion_rate = (completed / total) * 100
-    else:
-        completion_rate = 0
-    bot.send_message(message.chat.id, f"📊 Ваша статистика:\n✅ Выполнено: {completed}\n⏳ В процессе: {pending}\n📌 Всего задач: {total}\n🏆 Успешность: {completion_rate:.2f}%")
+    points = task_manager.get_user_points(user_id)
+    bot.send_message(message.chat.id, f"🏆 Ваши баллы: *{points}*\n🚀 Чем больше задач выполнено – тем выше уровень!", parse_mode="Markdown")
+
+@bot.message_handler(commands=['reminders'])
+def send_reminders():
+    while True:
+        now = datetime.now().strftime('%Y-%m-%d %H:%M')
+        conn = sqlite3.connect("database.db")
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, name FROM tasks WHERE status = 'pending' AND deadline <= ?", (now,))
+        tasks = cur.fetchall()
+        for user_id, name in tasks:
+            bot.send_message(user_id, f"⏰ Напоминание: Пора выполнить задачу *{name}*!", parse_mode="Markdown")
+        time.sleep(60)
+
+t = threading.Thread(target=send_reminders)
+t.daemon = True
+t.start()
 
 bot.infinity_polling()
